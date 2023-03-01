@@ -1,0 +1,1355 @@
+---
+title: "Digital VDH Analysis"
+author: "Rioch Brewer"
+date: "06/02/2023"
+output: html_document
+---
+
+This document examines:
+
+ * the impact that each digital product has on VDH overall i.e. what would happen if to VDH if we removed it
+ * what would happen to VDH if we improved it (an additional hour, an additional day, as an additional product) (including overlaps)
+ * how the digital products affect VFM
+
+
+```{r setup, include=FALSE}
+rm(list = ls())
+Sys.setenv(TZ="UTC")
+knitr::opts_chunk$set(echo = TRUE)
+
+#source("/home/jovyan/Miscellaneous/Compass Utils.R")
+
+library(matrixStats)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(dbplyr)
+library(ggplot2)
+library(purrr)
+#install.packages("RPostgreSQL")
+library(RPostgreSQL)
+library(readr)
+
+'%ni%' <- Negate('%in%')
+
+
+#bbc_kill_dbi_connections()
+```
+
+# Connect to the tables
+
+```{r}
+compass.audience <- 
+  dbcon %>% 
+  tbl(
+    in_schema(
+      "research_measurement_data",
+      "compass_audience_enriched"
+    )
+  )
+
+
+compass.panel <- 
+  dbcon %>% 
+  tbl(
+    in_schema(
+      "research_measurement_data",
+      "compass_panelists_enriched"
+    )
+  )  
+
+vars.audience = as.data.frame(colnames(compass.audience))
+vars.panel = as.data.frame(colnames(compass.panel))
+
+```
+
+# Creating Overall VDH
+
+This section creates a resp-week level table with time, dpw, and breadth at an overall level.
+
+```{r check tables}
+
+update.dates = 
+  compass.panel %>%
+  group_by(update_date) %>%
+  tally() %>%
+  collect()
+
+stream.label = 
+  compass.audience %>%
+  group_by(stream_label) %>%
+  tally() %>%
+  collect()
+
+```
+
+```{r identify BBC}
+
+compass.audience = 
+  compass.audience %>%
+  mutate(bbc.flag = case_when(  (grepl("BBC", stream_label, ignore.case = TRUE)==TRUE  &
+                                grepl("YouTube", stream_label)==FALSE &
+                                grepl("Facebook", stream_label)==FALSE &
+                                grepl("Twitter", stream_label)==FALSE &
+                                grepl("Instagram", stream_label)==FALSE &
+                                grepl("BBCgoodfood.Com", stream_label)==FALSE &
+                                stream_label!="BBC Good Food" &
+                                stream_label!="BBC Good Food - App" &
+                                stream_label!="Google AMP (BBC)") | 
+                                (grepl("CBeebies", stream_label, ignore.case = TRUE)==TRUE & 
+                                  grepl("YouTube", stream_label)==FALSE) ~ "BBC",
+                                TRUE ~ "Other"))  %>%
+  mutate(bbc.platform = case_when((data_type %in% c("LIVE", "VOSDAL", "TSV") & device == "TV" & grepl("Radio", stream_label)==FALSE)|
+                                      (data_type=="VOD PLAYER" & stream_label!="BBC Podcasts - Online Player")| 
+                                    stream_label %in% c("BBC iPlayer - App", "BBC iPlayer Home - Online Player", 
+                                                        "BBC iPlayer Kids - App") ~ "Watching",
+                                   (data_type %in% c("LIVE") & device == "RADIO" | grepl("Radio", stream_label)==TRUE) |
+                                     grepl("BBC Sounds", stream_label)==TRUE |
+                                    stream_label=="BBC Podcasts - Online Player" ~ "Listening",
+                                   TRUE ~ "Explore")) %>%
+  mutate(digital.platform = case_when(bbc.platform=="Watching" & 
+                                        (data_type=="VOD PLAYER" | grepl("iPlayer", stream_label)==TRUE) & 
+                                        stream_label!="BBC Podcasts - Online Player" ~ "iPlayer",
+                                      bbc.platform=="Listening" & 
+                                        (grepl("Online Player", stream_label, ignore.case = TRUE) == TRUE|
+                                           grepl("Sounds", stream_label, ignore.case = TRUE) == TRUE) ~ "Sounds",
+                                      bbc.platform == "Explore" & grepl("News", stream_label, ignore.case = TRUE)==TRUE ~ "News",
+                                      bbc.platform == "Explore" & grepl("Sport", stream_label, ignore.case = TRUE)==TRUE ~ "Sport",
+                                      bbc.platform == "Explore" ~ "Other BBC website / app",
+                                         TRUE ~ "Non-digital platform"))
+
+
+bbc.flag.check = 
+  compass.audience %>%
+  group_by(stream_label, bbc.flag) %>%
+  tally() %>%
+  collect()
+
+bbc.platforms.check = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(bbc.platform, stream_label, data_type, device) %>%
+  tally() %>%
+  collect()
+
+bbc.digital.check = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(digital.platform, stream_label) %>%
+  tally() %>%
+  collect()
+
+iplayer.time.check = 
+  compass.audience %>%
+  filter(update_date>="2022-11-28" & update_date<="2022-12-26" & bbc.flag=="BBC" & 
+           bbc.platform=="Watching" & digital.platform=="iPlayer") %>%
+  left_join(compass.panel, by = c("update_date", "compass_id")) %>%
+  group_by(update_date) %>%
+  summarise(mins = sum(duration_secs*weight)/60) %>%
+  collect()
+
+```
+
+```{r Overall time}
+
+time = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(compass_id, update_date) %>%
+  summarise(mins = sum(duration_secs, na.rm = TRUE)/60) %>%
+  ungroup()
+
+time.product = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(compass_id, update_date, digital.platform) %>%
+  summarise(mins.product = sum(duration_secs)/60) %>%
+  ungroup()
+
+```
+
+```{r Overall dpw}
+
+min.hour = compass.audience %>%
+  group_by(update_date) %>%
+  summarise(min = min(start_datetime, na.rm = TRUE),
+            max = max(start_datetime)) %>%
+  ungroup() %>%
+  mutate(min.hour = DATE_PART('hour', min)) %>%
+  select(update_date, min.hour) 
+
+compass.audience = compass.audience %>%
+  left_join(min.hour, by="update_date")
+
+dpw = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC")  %>%
+  mutate(date = TRUNC(start_datetime)) %>%
+  mutate(Hour = DATE_PART('hour',start_datetime)) %>%
+  mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>%
+  mutate(final.day = DATE_PART('day', update_date)+6) %>%
+  mutate(day = case_when(Hour>=min.hour ~ DATE_PART('day', start_datetime),
+                         Hour<min.hour ~ DATE_PART('day', date.m1))) %>%
+  group_by(compass_id, update_date, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date) %>%
+  summarise(dpw = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+dpw.product = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC")  %>%
+  mutate(date = TRUNC(start_datetime)) %>%
+  mutate(Hour = DATE_PART('hour',start_datetime)) %>%
+  mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>%
+  mutate(final.day = DATE_PART('day', update_date)+6) %>%
+  mutate(day = case_when(Hour>=min.hour ~ DATE_PART('day', start_datetime),
+                         Hour<min.hour ~ DATE_PART('day', date.m1))) %>%
+  group_by(compass_id, update_date, digital.platform, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date, digital.platform) %>%
+  summarise(dpw.product = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+
+```{r Overall breadth}
+
+# There are some mis-labellings between stream_label and device during the pandemic. In this case the device takes priority.
+
+breadth = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(compass_id, update_date, bbc.platform) %>%
+  tally() %>%
+  group_by(compass_id, update_date) %>%
+  summarise(bbc.platforms = n()) %>%
+  ungroup()
+
+tv = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & bbc.platform=="Watching") %>%
+  group_by(compass_id, update_date) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(bbc.tv = 1)
+
+```
+
+```{r Overall VDH}
+
+vdh = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time, by = c("compass_id", "update_date")) %>%
+  left_join(dpw, by = c("compass_id", "update_date")) %>%
+  left_join(breadth, by = c("compass_id", "update_date")) %>%
+  left_join(tv, by = c("compass_id", "update_date")) %>%
+  collect()
+
+vdh[is.na(vdh)] = 0
+
+results.vdh = 
+  vdh %>%
+  mutate(overall.vdh = case_when(mins >= 5*60 & dpw >= 5 & bbc.platforms >= 2 & bbc.tv == 1 ~ 1,
+                                 TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(vdh = weighted.mean(x = overall.vdh, w = weight)) %>%
+  ungroup()
+
+```
+
+# Creating VDH without iPlayer
+
+```{r}
+
+time.minus.iPlayer = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="iPlayer") %>%
+  group_by(compass_id, update_date) %>%
+  summarise(mins = sum(duration_secs, na.rm = TRUE)/60) %>%
+  ungroup()
+
+dpw.minus.iPlayer = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC" & digital.platform!="iPlayer")  %>%
+  mutate(date = TRUNC(start_datetime)) %>%
+  mutate(Hour = DATE_PART('hour',start_datetime)) %>%
+  mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>%
+  mutate(final.day = DATE_PART('day', update_date)+6) %>%
+  mutate(day = case_when(Hour>=min.hour ~ DATE_PART('day', start_datetime),
+                         Hour<min.hour ~ DATE_PART('day', date.m1))) %>%
+  group_by(compass_id, update_date, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date) %>%
+  summarise(dpw = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+breadth.minus.iPlayer = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="iPlayer") %>%
+  group_by(compass_id, update_date, bbc.platform) %>%
+  tally() %>%
+  group_by(compass_id, update_date) %>%
+  summarise(bbc.platforms = n()) %>%
+  ungroup()
+
+tv.minus.iPlayer = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & bbc.platform=="Watching" & digital.platform!="iPlayer") %>%
+  group_by(compass_id, update_date) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(bbc.tv = 1)
+
+vdh.minus.iPlayer = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time.minus.iPlayer, by = c("compass_id", "update_date")) %>%
+  left_join(dpw.minus.iPlayer, by = c("compass_id", "update_date")) %>%
+  left_join(breadth.minus.iPlayer, by = c("compass_id", "update_date")) %>%
+  left_join(tv.minus.iPlayer, by = c("compass_id", "update_date")) %>%
+  collect()
+
+vdh.minus.iPlayer[is.na(vdh.minus.iPlayer)] = 0
+
+results.vdh.minus.iPlayer = 
+  vdh.minus.iPlayer %>%
+  mutate(vdh = case_when(mins >= 5*60 & dpw >= 5 & bbc.platforms >= 2 & bbc.tv == 1 ~ 1,
+                                 TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(vdh.minus.iPlayer = weighted.mean(x = vdh, w = weight)) %>%
+  ungroup()
+
+```
+
+
+# Creating VDH without Sounds
+
+```{r}
+
+time.minus.Sounds = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="Sounds") %>%
+  group_by(compass_id, update_date) %>%
+  summarise(mins = sum(duration_secs, na.rm = TRUE)/60) %>%
+  ungroup()
+
+dpw.minus.Sounds = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC" & digital.platform!="Sounds")  %>%
+  mutate(date = TRUNC(start_datetime)) %>%
+  mutate(Hour = DATE_PART('hour',start_datetime)) %>%
+  mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>%
+  mutate(final.day = DATE_PART('day', update_date)+6) %>%
+  mutate(day = case_when(Hour>=min.hour ~ DATE_PART('day', start_datetime),
+                         Hour<min.hour ~ DATE_PART('day', date.m1))) %>%
+  group_by(compass_id, update_date, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date) %>%
+  summarise(dpw = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+breadth.minus.Sounds = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="Sounds") %>%
+  group_by(compass_id, update_date, bbc.platform) %>%
+  tally() %>%
+  group_by(compass_id, update_date) %>%
+  summarise(bbc.platforms = n()) %>%
+  ungroup()
+
+tv.minus.Sounds = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & bbc.platform=="Watching" & digital.platform!="Sounds") %>%
+  group_by(compass_id, update_date) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(bbc.tv = 1)
+
+vdh.minus.Sounds = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time.minus.Sounds, by = c("compass_id", "update_date")) %>%
+  left_join(dpw.minus.Sounds, by = c("compass_id", "update_date")) %>%
+  left_join(breadth.minus.Sounds, by = c("compass_id", "update_date")) %>%
+  left_join(tv.minus.Sounds, by = c("compass_id", "update_date")) %>%
+  collect()
+
+vdh.minus.Sounds[is.na(vdh.minus.Sounds)] = 0
+
+results.vdh.minus.Sounds = 
+  vdh.minus.Sounds %>%
+  mutate(vdh = case_when(mins >= 5*60 & dpw >= 5 & bbc.platforms >= 2 & bbc.tv == 1 ~ 1,
+                                 TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(vdh.minus.Sounds = weighted.mean(x = vdh, w = weight)) %>%
+  ungroup()
+
+```
+
+# Creating VDH without News
+
+```{r}
+
+time.minus.News = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="News") %>%
+  group_by(compass_id, update_date) %>%
+  summarise(mins = sum(duration_secs, na.rm = TRUE)/60) %>%
+  ungroup()
+
+dpw.minus.News = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC" & digital.platform!="News")  %>%
+  mutate(date = TRUNC(start_datetime)) %>%
+  mutate(Hour = DATE_PART('hour',start_datetime)) %>%
+  mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>%
+  mutate(final.day = DATE_PART('day', update_date)+6) %>%
+  mutate(day = case_when(Hour>=min.hour ~ DATE_PART('day', start_datetime),
+                         Hour<min.hour ~ DATE_PART('day', date.m1))) %>%
+  group_by(compass_id, update_date, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date) %>%
+  summarise(dpw = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+breadth.minus.News = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="News") %>%
+  group_by(compass_id, update_date, bbc.platform) %>%
+  tally() %>%
+  group_by(compass_id, update_date) %>%
+  summarise(bbc.platforms = n()) %>%
+  ungroup()
+
+tv.minus.News = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & bbc.platform=="Watching" & digital.platform!="News") %>%
+  group_by(compass_id, update_date) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(bbc.tv = 1)
+
+vdh.minus.News = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time.minus.News, by = c("compass_id", "update_date")) %>%
+  left_join(dpw.minus.News, by = c("compass_id", "update_date")) %>%
+  left_join(breadth.minus.News, by = c("compass_id", "update_date")) %>%
+  left_join(tv.minus.News, by = c("compass_id", "update_date")) %>%
+  collect()
+
+vdh.minus.News[is.na(vdh.minus.News)] = 0
+
+results.vdh.minus.News = 
+  vdh.minus.News %>%
+  mutate(vdh = case_when(mins >= 5*60 & dpw >= 5 & bbc.platforms >= 2 & bbc.tv == 1 ~ 1,
+                                 TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(vdh.minus.News = weighted.mean(x = vdh, w = weight)) %>%
+  ungroup()
+
+```
+
+# Creating VDH without Sport
+
+```{r}
+
+time.minus.Sport = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="Sport") %>%
+  group_by(compass_id, update_date) %>%
+  summarise(mins = sum(duration_secs, na.rm = TRUE)/60) %>%
+  ungroup()
+
+dpw.minus.Sport = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC" & digital.platform!="Sport")  %>%
+  mutate(date = TRUNC(start_datetime)) %>%
+  mutate(Hour = DATE_PART('hour',start_datetime)) %>%
+  mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>%
+  mutate(final.day = DATE_PART('day', update_date)+6) %>%
+  mutate(day = case_when(Hour>=min.hour ~ DATE_PART('day', start_datetime),
+                         Hour<min.hour ~ DATE_PART('day', date.m1))) %>%
+  group_by(compass_id, update_date, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date) %>%
+  summarise(dpw = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+breadth.minus.Sport = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="Sport") %>%
+  group_by(compass_id, update_date, bbc.platform) %>%
+  tally() %>%
+  group_by(compass_id, update_date) %>%
+  summarise(bbc.platforms = n()) %>%
+  ungroup()
+
+tv.minus.Sport = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & bbc.platform=="Watching" & digital.platform!="Sport") %>%
+  group_by(compass_id, update_date) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(bbc.tv = 1)
+
+vdh.minus.Sport = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time.minus.Sport, by = c("compass_id", "update_date")) %>%
+  left_join(dpw.minus.Sport, by = c("compass_id", "update_date")) %>%
+  left_join(breadth.minus.Sport, by = c("compass_id", "update_date")) %>%
+  left_join(tv.minus.Sport, by = c("compass_id", "update_date")) %>%
+  collect()
+
+vdh.minus.Sport[is.na(vdh.minus.Sport)] = 0
+
+results.vdh.minus.Sport = 
+  vdh.minus.Sport %>%
+  mutate(vdh = case_when(mins >= 5*60 & dpw >= 5 & bbc.platforms >= 2 & bbc.tv == 1 ~ 1,
+                                 TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(vdh.minus.Sport = weighted.mean(x = vdh, w = weight)) %>%
+  ungroup()
+
+```
+
+# Creating VDH without Other web
+
+```{r}
+
+time.minus.Other.Web = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="Other BBC website / app") %>%
+  group_by(compass_id, update_date) %>%
+  summarise(mins = sum(duration_secs, na.rm = TRUE)/60) %>%
+  ungroup()
+
+dpw.minus.Other.Web = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC" & digital.platform!="Other BBC website / app")  %>%
+  mutate(date = TRUNC(start_datetime)) %>%
+  mutate(Hour = DATE_PART('hour',start_datetime)) %>%
+  mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>%
+  mutate(final.day = DATE_PART('day', update_date)+6) %>%
+  mutate(day = case_when(Hour>=min.hour ~ DATE_PART('day', start_datetime),
+                         Hour<min.hour ~ DATE_PART('day', date.m1))) %>%
+  group_by(compass_id, update_date, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date) %>%
+  summarise(dpw = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+breadth.minus.Other.Web = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & digital.platform!="Other BBC website / app") %>%
+  group_by(compass_id, update_date, bbc.platform) %>%
+  tally() %>%
+  group_by(compass_id, update_date) %>%
+  summarise(bbc.platforms = n()) %>%
+  ungroup()
+
+tv.minus.Other.Web = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & bbc.platform=="Watching" & digital.platform!="Other BBC website / app") %>%
+  group_by(compass_id, update_date) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(bbc.tv = 1)
+
+vdh.minus.Other.Web = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time.minus.Other.Web, by = c("compass_id", "update_date")) %>%
+  left_join(dpw.minus.Other.Web, by = c("compass_id", "update_date")) %>%
+  left_join(breadth.minus.Other.Web, by = c("compass_id", "update_date")) %>%
+  left_join(tv.minus.Other.Web, by = c("compass_id", "update_date")) %>%
+  collect()
+
+vdh.minus.Other.Web[is.na(vdh.minus.Other.Web)] = 0
+
+results.vdh.minus.Other.Web = 
+  vdh.minus.Other.Web %>%
+  mutate(vdh = case_when(mins >= 5*60 & dpw >= 5 & bbc.platforms >= 2 & bbc.tv == 1 ~ 1,
+                                 TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(vdh.minus.Other.Web = weighted.mean(x = vdh, w = weight)) %>%
+  ungroup()
+
+```
+
+# Combining Results Together
+
+```{r}
+
+library(plotly)
+# VDH
+ggplotly(
+  results.vdh %>%
+  left_join(results.vdh.minus.iPlayer, by = c("update_date")) %>%
+  left_join(results.vdh.minus.Sounds, by = c("update_date")) %>%
+  left_join(results.vdh.minus.News, by = c("update_date")) %>%
+  left_join(results.vdh.minus.Sport, by = c("update_date")) %>%
+  left_join(results.vdh.minus.Other.Web, by = c("update_date")) %>%
+  gather(vdh.level, pct, vdh:vdh.minus.Other.Web) %>%
+  ggplot(aes(x = update_date, y = pct, col = vdh.level)) +
+  geom_smooth(se=FALSE) +
+  theme_classic() +  
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "VDH removing digital products")
+  )
+
+# Time
+ggplotly(
+  vdh %>%
+  mutate(time.threshold = case_when(mins>=5*60 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(overall.5hrs = weighted.mean(x = time.threshold, w = weight)) %>%
+  ungroup() %>%
+  left_join(vdh.minus.iPlayer %>%
+  mutate(time.threshold = case_when(mins>=5*60 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.iPlayer.5hrs = weighted.mean(x = time.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Sounds %>%
+  mutate(time.threshold = case_when(mins>=5*60 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Sounds.5hrs = weighted.mean(x = time.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.News %>%
+  mutate(time.threshold = case_when(mins>=5*60 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.News.5hrs = weighted.mean(x = time.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Sport %>%
+  mutate(time.threshold = case_when(mins>=5*60 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Sport.5hrs = weighted.mean(x = time.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Other.Web %>%
+  mutate(time.threshold = case_when(mins>=5*60 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Other.Web.5hrs = weighted.mean(x = time.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  gather(level, pct, overall.5hrs:Removing.Other.Web.5hrs) %>%
+  ggplot(aes(x = update_date, y = pct, col = level)) +
+  geom_smooth(se=FALSE) +
+  theme_classic() +  
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "5hrs % Reach removing digital products")
+  )
+
+# dpw
+ggplotly(
+  vdh %>%
+  mutate(dpw.threshold = case_when(dpw>=5 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(overall.5dpw = weighted.mean(x = dpw.threshold, w = weight)) %>%
+  ungroup() %>%
+  left_join(vdh.minus.iPlayer %>%
+  mutate(dpw.threshold = case_when(dpw>=5 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.iPlayer.5dpw = weighted.mean(x = dpw.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Sounds %>%
+  mutate(dpw.threshold = case_when(dpw>=5 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Sounds.5dpw = weighted.mean(x = dpw.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.News %>%
+  mutate(dpw.threshold = case_when(dpw>=5 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.News.5dpw = weighted.mean(x = dpw.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Sport %>%
+  mutate(dpw.threshold = case_when(dpw>=5 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Sport.5dpw = weighted.mean(x = dpw.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Other.Web %>%
+  mutate(dpw.threshold = case_when(dpw>=5 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Other.Web.5dpw = weighted.mean(x = dpw.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  gather(level, pct, overall.5dpw:Removing.Other.Web.5dpw) %>%
+  ggplot(aes(x = update_date, y = pct, col = level)) +
+  geom_smooth(se=FALSE) +
+  theme_classic() +  
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "5 dpw % Reach removing digital products")
+  )
+
+# breadth
+ggplotly(
+  vdh %>%
+  mutate(breadth.threshold = case_when(bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(overall.breadth = weighted.mean(x = breadth.threshold, w = weight)) %>%
+  ungroup() %>%
+  left_join(vdh.minus.iPlayer %>%
+  mutate(breadth.threshold = case_when(bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.iPlayer.breadth = weighted.mean(x = breadth.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Sounds %>%
+  mutate(breadth.threshold = case_when(bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Sounds.breadth = weighted.mean(x = breadth.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.News %>%
+  mutate(breadth.threshold = case_when(bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.News.breadth = weighted.mean(x = breadth.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Sport %>%
+  mutate(breadth.threshold = case_when(bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Sport.breadth = weighted.mean(x = breadth.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  left_join(vdh.minus.Other.Web %>%
+  mutate(breadth.threshold = case_when(bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                    TRUE ~ 0)) %>%
+  group_by(update_date) %>%
+  summarise(Removing.Other.Web.breadth = weighted.mean(x = breadth.threshold, w = weight)) %>%
+  ungroup(), 
+  by = c("update_date")) %>%
+  gather(level, pct, overall.breadth:Removing.Other.Web.breadth) %>%
+  ggplot(aes(x = update_date, y = pct, col = level)) +
+  geom_smooth(se=FALSE) +
+  theme_classic() +  
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Breadth Threshold % Reach removing digital products")
+  )
+
+```
+
+# Assessing VFM Impact
+VFM for those who were VDH, and those who were not. 
+Repeat as each product removed. 
+
+This analysis is slightly complicated due to the double negatives involved. 
+
+e.g. 
+Person 1 is overall VDH, and VDH without iPlayer. So iPlayer isn't an important element of VDH. Therefore iPlayer is coded 0. 
+Person 2 is overall VDH, but not VDH without iPlayer. So iPlayer is an important element of VDH. Therefore iPlayer is coded 1.
+
+This coding is repeated for all the products. 
+
+```{r}
+
+vdh.2 = 
+  vdh %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(bbc.vfm = case_when(as.numeric(bbc_vfm)<=10 ~ as.numeric(bbc_vfm))) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  select(compass_id, update_date, weight, Year, bbc.vfm, mins, vdh) %>%
+  left_join(vdh.minus.iPlayer %>%
+              mutate(vdh.minus.iPlayer = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                                   TRUE ~ 0)) %>%
+              select(compass_id, update_date, vdh.minus.iPlayer), 
+            by = c("update_date", "compass_id")) %>%
+  left_join(vdh.minus.Sounds %>%
+              mutate(vdh.minus.Sounds = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                                   TRUE ~ 0)) %>%
+              select(compass_id, update_date, vdh.minus.Sounds), 
+            by = c("update_date", "compass_id")) %>%
+  left_join(vdh.minus.News %>%
+              mutate(vdh.minus.News = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                                   TRUE ~ 0)) %>%
+              select(compass_id, update_date, vdh.minus.News), 
+            by = c("update_date", "compass_id")) %>%
+  left_join(vdh.minus.Sport %>%
+              mutate(vdh.minus.Sport = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                                   TRUE ~ 0)) %>%
+              select(compass_id, update_date, vdh.minus.Sport), 
+            by = c("update_date", "compass_id")) %>%
+  left_join(vdh.minus.Other.Web %>%
+              mutate(vdh.minus.Other.Web = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                                                   TRUE ~ 0)) %>%
+              select(compass_id, update_date, vdh.minus.Other.Web), 
+            by = c("update_date", "compass_id"))
+
+# All Adults
+vdh.3 = 
+  vdh.2 %>%
+  mutate(iPlayer = case_when(vdh == 1 & vdh.minus.iPlayer == 0 ~ 1,
+                             TRUE ~ 0),
+         Sounds = case_when(vdh == 1 & vdh.minus.Sounds == 0 ~ 1,
+                            TRUE ~ 0),
+         News = case_when(vdh == 1 & vdh.minus.News == 0 ~ 1,
+                            TRUE ~ 0),
+         Sport = case_when(vdh == 1 & vdh.minus.Sport == 0 ~ 1,
+                            TRUE ~ 0),
+         Other.Web = case_when(vdh == 1 & vdh.minus.Other.Web == 0 ~ 1,
+                            TRUE ~ 0))
+
+ggplotly(
+bind_cols(
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(iPlayer) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(iPlayer, vfm) %>%
+    mutate(iPlayer = `1` - `0`) %>%
+    select(iPlayer),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(Sounds) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(Sounds, vfm) %>%
+    mutate(Sounds = `1` - `0`) %>%
+    select(Sounds),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(News) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(News, vfm) %>%
+    mutate(News = `1` - `0`) %>%
+    select(News),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(Sport) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(Sport, vfm) %>%
+    mutate(Sport = `1` - `0`) %>%
+    select(Sport),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(Other.Web) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(Other.Web, vfm) %>%
+    mutate(Other.Web = `1` - `0`) %>%
+    select(Other.Web)
+) %>%
+  gather(level, vfm.impact, iPlayer:Other.Web) %>%
+  ggplot(aes(x = level, y = vfm.impact, fill = level)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_classic() +
+  labs(title = "Product Impact On VFM For Those VDH: All Adults")
+)
+
+
+# Lightest VDH users
+vdh.3 = 
+  vdh.2 %>%
+  mutate(iPlayer = case_when(vdh == 1 & vdh.minus.iPlayer == 0 ~ 1,
+                             TRUE ~ 0),
+         Sounds = case_when(vdh == 1 & vdh.minus.Sounds == 0 ~ 1,
+                            TRUE ~ 0),
+         News = case_when(vdh == 1 & vdh.minus.News == 0 ~ 1,
+                            TRUE ~ 0),
+         Sport = case_when(vdh == 1 & vdh.minus.Sport == 0 ~ 1,
+                            TRUE ~ 0),
+         Other.Web = case_when(vdh == 1 & vdh.minus.Other.Web == 0 ~ 1,
+                            TRUE ~ 0)) %>%
+  filter(mins<=420)
+
+ggplotly(
+bind_cols(
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(iPlayer) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(iPlayer, vfm) %>%
+    mutate(iPlayer = `1` - `0`) %>%
+    select(iPlayer),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(Sounds) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(Sounds, vfm) %>%
+    mutate(Sounds = `1` - `0`) %>%
+    select(Sounds),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(News) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(News, vfm) %>%
+    mutate(News = `1` - `0`) %>%
+    select(News),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(Sport) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(Sport, vfm) %>%
+    mutate(Sport = `1` - `0`) %>%
+    select(Sport),
+  vdh.3 %>%
+    filter(Year==2022 & vdh==1) %>%
+    group_by(Other.Web) %>%
+    summarise(vfm = weighted.mean(x = bbc.vfm, w = weight, na.rm = TRUE)) %>%
+    spread(Other.Web, vfm) %>%
+    mutate(Other.Web = `1` - `0`) %>%
+    select(Other.Web)
+) %>%
+  gather(level, vfm.impact, iPlayer:Other.Web) %>%
+  ggplot(aes(x = level, y = vfm.impact, fill = level)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_classic() +
+  labs(title = "Product Impact On VFM For Those VDH: <=7hrs In A Week")
+)
+
+
+```
+
+# Assessing VDH Growth Potential Of Products
+
+To calculate the growth potential of time increase by % 1%, 5%, 10% etc.
+
+To calculate the growth potential of freq use (days product used)/(total days BBC used) e.g. if iPlayer was used for 2 days, and total BBC for 4 days then iPlayer has a 50% chance of being a unique day. Compare this calculation with how total days changes if iPlayer removed. 
+
+Do the same calculation for breadth.
+
+```{r Increasing time}
+
+# Assessing impact that a x% increase in time would have 
+
+vdh.time = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time, by = c("compass_id", "update_date")) %>%
+  left_join(dpw, by = c("compass_id", "update_date")) %>%
+  left_join(breadth, by = c("compass_id", "update_date")) %>%
+  left_join(tv, by = c("compass_id", "update_date")) %>%
+  left_join(time.product, by = c("compass_id", "update_date")) %>%
+  collect() %>%
+    spread(digital.platform, mins.product)
+
+vdh.time[is.na(vdh.time)] = 0
+
+ggplotly(
+bind_rows(
+vdh %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(1.01*mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.5 = case_when(1.05*mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.10 = case_when(1.10*mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.5 = weighted.mean(x = vdh.5, w = weight),
+            vdh.10 = weighted.mean(x = vdh.10, w = weight)) %>%
+  mutate(Time.01 = vdh.1 - vdh,
+         Time.05 = vdh.5 - vdh,
+         Time.10 = vdh.10 - vdh) %>%
+  select(Time.01:Time.10) %>%
+  gather(Increase, VDH.Change ,Time.01:Time.10) %>%
+  mutate(Level = "Overall"),
+vdh.time %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when((iPlayer+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(((1.01*iPlayer)+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.5 = case_when(((1.05*iPlayer)+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.10 = case_when(((1.10*iPlayer)+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                              bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.5 = weighted.mean(x = vdh.5, w = weight),
+            vdh.10 = weighted.mean(x = vdh.10, w = weight)) %>%
+  mutate(Time.01 = vdh.1 - vdh,
+         Time.05 = vdh.5 - vdh,
+         Time.10 = vdh.10 - vdh) %>%
+  select(Time.01:Time.10) %>%
+  gather(Increase, VDH.Change ,Time.01:Time.10) %>%
+  mutate(Level = "iPlayer"),
+vdh.time %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when((iPlayer+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when((iPlayer+(1.01*Sounds)+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.5 = case_when((iPlayer+(1.05*Sounds)+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.10 = case_when((iPlayer+(1.10*Sounds)+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                              bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.5 = weighted.mean(x = vdh.5, w = weight),
+            vdh.10 = weighted.mean(x = vdh.10, w = weight)) %>%
+  mutate(Time.01 = vdh.1 - vdh,
+         Time.05 = vdh.5 - vdh,
+         Time.10 = vdh.10 - vdh) %>%
+  select(Time.01:Time.10) %>%
+  gather(Increase, VDH.Change ,Time.01:Time.10) %>%
+  mutate(Level = "Sounds"),
+vdh.time %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when((iPlayer+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when((iPlayer+Sounds+(1.01*News)+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.5 = case_when((iPlayer+Sounds+(1.05*News)+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.10 = case_when((iPlayer+Sounds+(1.10*News)+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                              bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.5 = weighted.mean(x = vdh.5, w = weight),
+            vdh.10 = weighted.mean(x = vdh.10, w = weight)) %>%
+  mutate(Time.01 = vdh.1 - vdh,
+         Time.05 = vdh.5 - vdh,
+         Time.10 = vdh.10 - vdh) %>%
+  select(Time.01:Time.10) %>%
+  gather(Increase, VDH.Change ,Time.01:Time.10) %>%
+  mutate(Level = "News"),
+vdh.time %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when((iPlayer+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when((iPlayer+Sounds+News+(1.01*Sport)+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.5 = case_when((iPlayer+Sounds+News+(1.05*Sport)+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.10 = case_when((iPlayer+Sounds+News+(1.10*Sport)+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 &
+                              bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.5 = weighted.mean(x = vdh.5, w = weight),
+            vdh.10 = weighted.mean(x = vdh.10, w = weight)) %>%
+  mutate(Time.01 = vdh.1 - vdh,
+         Time.05 = vdh.5 - vdh,
+         Time.10 = vdh.10 - vdh) %>%
+  select(Time.01:Time.10) %>%
+  gather(Increase, VDH.Change ,Time.01:Time.10) %>%
+  mutate(Level = "Sport"),
+vdh.time %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when((iPlayer+Sounds+News+Sport+`Other BBC website / app` + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when((iPlayer+Sounds+News+Sport+(1.01*`Other BBC website / app`) + `Non-digital platform`)>=5*60 & dpw>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.5 = case_when((iPlayer+Sounds+News+Sport+(1.05*`Other BBC website / app`) + `Non-digital platform`)>=5*60 & dpw>=5 &
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.10 = case_when((iPlayer+Sounds+News+Sport+(1.10*`Other BBC website / app`) + `Non-digital platform`)>=5*60 & dpw>=5 &
+                              bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.5 = weighted.mean(x = vdh.5, w = weight),
+            vdh.10 = weighted.mean(x = vdh.10, w = weight)) %>%
+  mutate(Time.01 = vdh.1 - vdh,
+         Time.05 = vdh.5 - vdh,
+         Time.10 = vdh.10 - vdh) %>%
+  select(Time.01:Time.10) %>%
+  gather(Increase, VDH.Change ,Time.01:Time.10) %>%
+  mutate(Level = "Other Web")
+) %>%
+  ggplot(aes(x = Increase, y = VDH.Change, fill = Increase)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(vars(Level)) +
+  theme_classic() +
+  labs(title = "Change in VDH from increaseing time by %") +
+    scale_y_continuous(labels = scales::percent)
+)
+
+
+```
+
+```{r Increasing dpw}
+
+vdh.dpw = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time, by = c("compass_id", "update_date")) %>%
+  left_join(dpw, by = c("compass_id", "update_date")) %>%
+  left_join(breadth, by = c("compass_id", "update_date")) %>%
+  left_join(tv, by = c("compass_id", "update_date")) %>%
+  left_join(dpw.product, by = c("compass_id", "update_date")) %>%
+  collect() %>%
+    spread(digital.platform, dpw.product)
+
+vdh.dpw[is.na(vdh.dpw)] = 0
+
+ggplotly(
+bind_rows(
+vdh %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(mins>=5*60 & dpw+1>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight)) %>%
+  mutate(dpw.01 = vdh.1 - vdh) %>%
+  select(dpw.01) %>%
+  gather(Increase, VDH.Change ,dpw.01) %>%
+  mutate(Level = "Overall"),
+vdh.dpw %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(mins>=5*60 & (dpw+((iPlayer+1)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.2 = case_when(mins>=5*60 & (dpw+((iPlayer+2)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.3 = case_when(mins>=5*60 & (dpw+((iPlayer+3)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.2 = weighted.mean(x = vdh.2, w = weight),
+            vdh.3 = weighted.mean(x = vdh.3, w = weight)) %>%
+  mutate(dpw.01 = vdh.1 - vdh,
+         dpw.02 = vdh.2 - vdh,
+         dpw.03 = vdh.3 - vdh) %>%
+  select(dpw.01:dpw.03) %>%
+  gather(Increase, VDH.Change ,dpw.01:dpw.03) %>%
+  mutate(Level = "iPlayer"),
+vdh.dpw %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(mins>=5*60 & (dpw+((Sounds+1)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.2 = case_when(mins>=5*60 & (dpw+((Sounds+2)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.3 = case_when(mins>=5*60 & (dpw+((Sounds+3)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.2 = weighted.mean(x = vdh.2, w = weight),
+            vdh.3 = weighted.mean(x = vdh.3, w = weight)) %>%
+  mutate(dpw.01 = vdh.1 - vdh,
+         dpw.02 = vdh.2 - vdh,
+         dpw.03 = vdh.3 - vdh) %>%
+  select(dpw.01:dpw.03) %>%
+  gather(Increase, VDH.Change ,dpw.01:dpw.03) %>%
+  mutate(Level = "Sounds"),
+vdh.dpw %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(mins>=5*60 & (dpw+((News+1)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.2 = case_when(mins>=5*60 & (dpw+((News+2)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.3 = case_when(mins>=5*60 & (dpw+((News+3)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.2 = weighted.mean(x = vdh.2, w = weight),
+            vdh.3 = weighted.mean(x = vdh.3, w = weight)) %>%
+  mutate(dpw.01 = vdh.1 - vdh,
+         dpw.02 = vdh.2 - vdh,
+         dpw.03 = vdh.3 - vdh) %>%
+  select(dpw.01:dpw.03) %>%
+  gather(Increase, VDH.Change ,dpw.01:dpw.03) %>%
+  mutate(Level = "News"),
+vdh.dpw %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(mins>=5*60 & (dpw+((Sport+1)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.2 = case_when(mins>=5*60 & (dpw+((Sport+2)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.3 = case_when(mins>=5*60 & (dpw+((Sport+3)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.2 = weighted.mean(x = vdh.2, w = weight),
+            vdh.3 = weighted.mean(x = vdh.3, w = weight)) %>%
+  mutate(dpw.01 = vdh.1 - vdh,
+         dpw.02 = vdh.2 - vdh,
+         dpw.03 = vdh.3 - vdh) %>%
+  select(dpw.01:dpw.03) %>%
+  gather(Increase, VDH.Change ,dpw.01:dpw.03) %>%
+  mutate(Level = "Sport"),
+vdh.dpw %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & 
+                           bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(mins>=5*60 & (dpw+((`Other BBC website / app`+1)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.2 = case_when(mins>=5*60 & (dpw+((`Other BBC website / app`+2)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.3 = case_when(mins>=5*60 & (dpw+((`Other BBC website / app`+3)/dpw))>=5 & 
+                             bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.2 = weighted.mean(x = vdh.2, w = weight),
+            vdh.3 = weighted.mean(x = vdh.3, w = weight)) %>%
+  mutate(dpw.01 = vdh.1 - vdh,
+         dpw.02 = vdh.2 - vdh,
+         dpw.03 = vdh.3 - vdh) %>%
+  select(dpw.01:dpw.03) %>%
+  gather(Increase, VDH.Change ,dpw.01:dpw.03) %>%
+  mutate(Level = "Other.Web")
+) %>%
+  ggplot(aes(x = Increase, y = VDH.Change, fill = Increase)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(vars(Level)) +
+  theme_classic() +
+  labs(title = "Change in VDH from increaseing dpw") +
+    scale_y_continuous(labels = scales::percent)
+)
+
+```
+
+```{r using a probablity model}
+
+ggplotly(
+vdh %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(vdh = case_when(mins>=5*60 & dpw>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.1 = case_when(mins>=5*60 & dpw+1>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.2 = case_when(mins>=5*60 & dpw+2>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0),
+         vdh.3 = case_when(mins>=5*60 & dpw+3>=5 & bbc.platforms>=2 & bbc.tv==1 ~ 1,
+                         TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(vdh = weighted.mean(x = vdh, w = weight),
+            vdh.1 = weighted.mean(x = vdh.1, w = weight),
+            vdh.2 = weighted.mean(x = vdh.2, w = weight),
+            vdh.3 = weighted.mean(x = vdh.3, w = weight)) %>%
+  mutate(dpw.01 = vdh.1 - vdh,
+         dpw.02 = vdh.2 - vdh,
+         dpw.03 = vdh.3 - vdh) %>%
+  select(dpw.01, dpw.02, dpw.03) %>%
+  gather(Increase, VDH.Change ,dpw.01:dpw.03) %>%
+  mutate(Level = "Overall") %>%
+  ggplot(aes(x = Increase, y = VDH.Change, fill = Increase)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_classic() +
+  labs(title = "VDH Change By Increasing DPW")
+)
+
+ggplotly(
+vdh.dpw %>%
+  mutate(Year = year(update_date)) %>%
+  mutate(rand.num = runif(n = c(1:nrow(vdh.dpw)), min = 0, max = 1)) %>%
+  mutate(probability.unique.dpw.iPlayer = iPlayer/dpw,
+         probability.unique.dpw.Sounds = Sounds/dpw,
+         probability.unique.dpw.News = News/dpw,
+         probability.unique.dpw.Sport = Sport/dpw,
+         probability.unique.dpw.Other.Web = `Other BBC website / app`/dpw) %>%
+  mutate(unique.day.iPlayer = case_when(probability.unique.dpw.iPlayer>=rand.num ~ 1,
+                                 TRUE ~ 0),
+         unique.day.Sounds = case_when(probability.unique.dpw.Sounds>=rand.num ~ 1,
+                                 TRUE ~ 0),
+         unique.day.News = case_when(probability.unique.dpw.News>=rand.num ~ 1,
+                                 TRUE ~ 0),
+         unique.day.Sport = case_when(probability.unique.dpw.Sport>=rand.num ~ 1,
+                                 TRUE ~ 0),
+         unique.day.Other.Web = case_when(probability.unique.dpw.Other.Web>=rand.num ~ 1,
+                                 TRUE ~ 0)) %>%
+  filter(Year==2022) %>%
+  summarise(iPlayer = weighted.mean(x = probability.unique.dpw.iPlayer, w = weight, na.rm = TRUE),
+            Sounds = weighted.mean(x = probability.unique.dpw.Sounds, w = weight, na.rm = TRUE),
+            News = weighted.mean(x = probability.unique.dpw.News, w = weight, na.rm = TRUE),
+            Sport = weighted.mean(x = probability.unique.dpw.Sport, w = weight, na.rm = TRUE),
+            Other.Web = weighted.mean(x = probability.unique.dpw.Other.Web, w = weight, na.rm = TRUE)) %>%
+  gather(level, probability, iPlayer:Other.Web) %>%
+  ggplot(aes(x = level, y = probability, fill = level)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_classic() +
+  labs(title = "Probability Of A Unique Day by Product")
+)
+  
+
+```
