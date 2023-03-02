@@ -1,0 +1,335 @@
+---
+title: "vb_defining_552_users"
+author: "VickyBanks"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#rm(list = ls())
+Sys.setenv(TZ="UTC")
+knitr::opts_chunk$set(echo = TRUE)
+options(java.parameters = "-Xmx64g")
+library(tidyverse)
+library(stringr)
+library(rJava)
+library(RJDBC)
+library(tidyverse)
+library(lubridate)
+library(httr)
+library(curl)
+theme_set(theme_classic())
+```
+
+# Connect to the tables
+
+```{r}
+######### Get Redshift creds (local R) #########
+options(java.parameters = "-Xmx64g")
+driver <-JDBC("com.amazon.redshift.jdbc41.Driver","~/.redshiftTools/redshift-driver.jar",identifier.quote = "`")
+my_aws_creds <-read.csv("~/Documents/Projects/DS/redshift_creds.csv",header = TRUE,stringsAsFactors = FALSE)
+url <-paste0("jdbc:redshift://localhost:5439/redshiftdb?user=",my_aws_creds$user,"&password=",my_aws_creds$password)
+conn <- dbConnect(driver, url)
+dbGetQuery(conn,"select distinct brand_title, series_title from prez.scv_vmb ORDER BY RANDOM() limit 10;")
+
+
+##get empty df with correct columns
+compass.audience <- dbGetQuery(
+  conn,
+  paste0(
+    "SELECT *
+    FROM research_measurement_data.compass_audience_enriched
+  WHERE start_datetime >= '2022-01-01' and start_datetime < '2023-01-01'
+  AND stream_label ILIKE '%BBC%'LIMIT 1 ; "
+  )
+) %>% tail(-1)
+
+
+start_date<-ymd('2022-01-01')
+for(i in 1:12){
+  print(start_date)
+
+sql <- paste0(
+  "SELECT *
+    FROM research_measurement_data.compass_audience_enriched
+  WHERE start_datetime >= '",start_date,"' and start_datetime < '",start_date %m+% months(1) ,"'
+  AND stream_label ILIKE '%BBC%' ; "
+)
+
+temp<-dbGetQuery(conn, sql)
+compass.audience <- compass.audience %>% rbind(temp)
+rm(temp)
+start_date<-start_date%m+% months(1)
+}
+
+compass.panel = dbGetQuery(conn, "SELECT * FROM research_measurement_data.compass_panelists_enriched WHERE update_date >= '2022-01-01' AND update_date < '2023-01-01'; ")
+
+##get the colnames in a df
+vars.audience = as.data.frame(colnames(compass.audience))
+vars.panel = as.data.frame(colnames(compass.panel))
+
+```
+# Creating Overall VDH
+
+This section creates a resp-week level table with time, dpw, and breadth at an overall level.
+
+```{r check tables}
+
+update.dates = 
+  compass.panel %>%
+  group_by(update_date) %>%
+  tally() %>%
+  collect()
+
+stream.label = 
+  compass.audience %>%
+  group_by(stream_label) %>%
+  tally() %>%
+  collect()
+
+```
+
+
+```{r identify BBC}
+
+compass.audience = 
+  compass.audience %>%
+  mutate(bbc.flag = case_when(  (grepl("BBC", stream_label, ignore.case = TRUE)==TRUE  &
+                                grepl("YouTube", stream_label)==FALSE &
+                                grepl("Facebook", stream_label)==FALSE &
+                                grepl("Twitter", stream_label)==FALSE &
+                                grepl("Instagram", stream_label)==FALSE &
+                                grepl("BBCgoodfood.Com", stream_label)==FALSE &
+                                stream_label!="BBC Good Food" &
+                                stream_label!="BBC Good Food - App" &
+                                stream_label!="Google AMP (BBC)") | 
+                                (grepl("CBeebies", stream_label, ignore.case = TRUE)==TRUE & 
+                                  grepl("YouTube", stream_label)==FALSE) ~ "BBC",
+                                TRUE ~ "Other"))  %>%
+  mutate(bbc.platform = case_when((data_type %in% c("LIVE", "VOSDAL", "TSV") & device == "TV" & grepl("Radio", stream_label)==FALSE)|
+                                      (data_type=="VOD PLAYER" & stream_label!="BBC Podcasts - Online Player")| 
+                                    stream_label %in% c("BBC iPlayer - App", "BBC iPlayer Home - Online Player", 
+                                                        "BBC iPlayer Kids - App") ~ "Watching",
+                                   (data_type %in% c("LIVE") & device == "RADIO" | grepl("Radio", stream_label)==TRUE) |
+                                     grepl("BBC Sounds", stream_label)==TRUE |
+                                    stream_label=="BBC Podcasts - Online Player" ~ "Listening",
+                                   TRUE ~ "Explore")) %>%
+  mutate(digital.platform = case_when(bbc.platform=="Watching" & 
+                                        (data_type=="VOD PLAYER" | grepl("iPlayer", stream_label)==TRUE) & 
+                                        stream_label!="BBC Podcasts - Online Player" ~ "iPlayer",
+                                      bbc.platform=="Listening" & 
+                                        (grepl("Online Player", stream_label, ignore.case = TRUE) == TRUE|
+                                           grepl("Sounds", stream_label, ignore.case = TRUE) == TRUE) ~ "Sounds",
+                                      bbc.platform == "Explore" & grepl("News", stream_label, ignore.case = TRUE)==TRUE ~ "News",
+                                      bbc.platform == "Explore" & grepl("Sport", stream_label, ignore.case = TRUE)==TRUE ~ "Sport",
+                                      bbc.platform == "Explore" ~ "Other BBC website / app",
+                                         TRUE ~ "Non-digital platform"))
+
+
+compass.audience$duration_secs<-as.numeric(compass.audience$duration_secs)
+compass.panel$weight<-as.numeric(compass.panel$weight)
+
+bbc.flag.check = 
+  compass.audience %>%
+  group_by(stream_label, bbc.flag) %>%
+  tally() %>%
+  collect()
+
+bbc.platforms.check = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(bbc.platform, stream_label, data_type, device) %>%
+  tally() %>%
+  collect()
+
+bbc.digital.check = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(digital.platform, stream_label) %>%
+  tally() %>%
+  collect()
+
+
+iplayer.time.check = 
+  compass.audience %>%
+  filter(update_date>="2022-11-28" & update_date<="2022-12-26" & bbc.flag=="BBC" & 
+           bbc.platform=="Watching" & digital.platform=="iPlayer") %>%
+  left_join(compass.panel, by = c("update_date", "compass_id")) %>%
+  group_by(update_date) %>%
+  summarise(mins = sum(duration_secs*weight)/60) %>%
+  collect()
+
+iplayer.time.check
+
+```
+
+
+```{r Overall time}
+
+time = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(compass_id, update_date) %>%
+  summarise(mins = sum(duration_secs, na.rm = TRUE)/60) %>%
+  ungroup() 
+
+time.product = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(compass_id, update_date, digital.platform) %>%
+  summarise(mins.product = sum(duration_secs)/60) %>%
+  ungroup()
+
+
+
+```
+
+
+```{r Overall dpw}
+
+min.hour = compass.audience %>%
+  group_by(update_date) %>%
+  summarise(min = min(start_datetime, na.rm = TRUE),
+            max = max(start_datetime)) %>%
+  ungroup() %>%
+  mutate(min.hour = hour(min)) %>%
+  select(update_date, min.hour) 
+
+compass.audience = compass.audience %>%
+  left_join(min.hour, by="update_date")
+
+##Barb date quirks - the day goes from 6am to 6am
+# update_date = 2022 - 12 - 19 00:00:00.000000,
+# min = 2022 - 12 - 19 06:00:00.000000
+# max = 2022 - 12 - 26 05:59:00.000000
+# So that is a 7 day period
+dpw = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC")  %>%
+  mutate(date = as.Date(start_datetime)) %>%
+  mutate(Hour = hour(start_datetime)) %>%
+  #mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>% 
+   mutate(date.m1 =  as.Date(start_datetime)-1 ) %>% ##previous day
+  mutate(final.day = as.Date(update_date)+6) %>%
+  ## if time 6am-midnight then day is that day
+  ## if time less than 6am it's previous day
+  mutate(day = case_when(Hour >= min.hour ~  day(as.Date(start_datetime) ),
+                         Hour<min.hour ~ day(date.m1) )) %>%
+  group_by(compass_id, update_date, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date) %>%
+  summarise(dpw = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+dpw.product = 
+  compass.audience %>%
+  filter(bbc.flag == "BBC")  %>%
+  mutate(date = as.Date(start_datetime)) %>%
+  mutate(Hour = hour(start_datetime)) %>%
+  #mutate(date.m1 =  sql('DATEADD(day, -1, start_datetime)') ) %>% 
+   mutate(date.m1 =  as.Date(start_datetime)-1 ) %>% ##previous day
+  mutate(final.day = as.Date(update_date)+6) %>%
+  ## if time 6am-midnight then day is that day
+  ## if time less than 6am it's previous day
+  mutate(day = case_when(Hour >= min.hour ~  day(as.Date(start_datetime) ),
+                         Hour<min.hour ~ day(date.m1) )) %>%
+  group_by(compass_id, update_date, digital.platform, day) %>%
+  tally() %>%
+  mutate(n = ifelse(n>=1,1,0)) %>%
+  group_by(compass_id, update_date, digital.platform) %>%
+  summarise(dpw.product = sum(n, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+
+```{r Overall breadth}
+
+# There are some mis-labellings between stream_label and device during the pandemic. In this case the device takes priority.
+
+breadth = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC") %>%
+  group_by(compass_id, update_date, bbc.platform) %>%
+  tally() %>%
+  group_by(compass_id, update_date) %>%
+  summarise(bbc.platforms = n()) %>%
+  ungroup()
+
+tv = 
+  compass.audience %>%
+  filter(bbc.flag=="BBC" & bbc.platform=="Watching") %>%
+  group_by(compass_id, update_date) %>%
+  tally() %>%
+  ungroup() %>%
+  mutate(bbc.tv = 1)
+
+```
+
+```{r Overall VDH}
+
+vdh = 
+  compass.panel %>%
+  select(compass_id, update_date, weight, bbc_vfm) %>%
+  left_join(time, by = c("compass_id", "update_date")) %>%
+  left_join(dpw, by = c("compass_id", "update_date")) %>%
+  left_join(breadth, by = c("compass_id", "update_date")) %>%
+  left_join(tv, by = c("compass_id", "update_date")) %>%
+  collect()
+
+vdh[is.na(vdh)] = 0
+
+results.vdh =
+  vdh %>%
+  mutate(overall.vdh = case_when(mins >= 5 * 60 & #5 hrs
+                                   dpw >= 5 & #5 days
+                                   bbc.platforms >= 2 & #2 modes
+                                   bbc.tv == 1 ~ 1, #and includes tv
+                                 TRUE ~ 0)) %>% ##then they meet 552 then 1
+  group_by(update_date) %>%
+  summarise(vdh = weighted.mean(x = overall.vdh, w = weight)) %>%
+  ungroup()
+
+```
+
+```{r checks}
+##per person vhd
+met_vdh <-
+  vdh %>%   mutate(overall.vdh = case_when(mins >= 5 * 60 & #5 hrs
+                                             dpw >= 5 & #5 days
+                                             bbc.platforms >= 2 & #2 modes
+                                             bbc.tv == 1 ~ 1, #and includes tv
+                                           TRUE ~ 0))  ##then they meet 552 then 1
+write.csv(met_vdh %>% filter(compass_id %in% vdh$compass_id[1:3]), "test_vdh.csv")
+
+met_vdh %>%  select(compass_id,update_date, overall.vdh) %>% filter(compass_id %in% vdh$compass_id[1:3]) %>% 
+  ggplot(aes(x = update_date, y =overall.vdh, colour = compass_id))+
+  geom_point()+
+  facet_wrap(~compass_id, ncol = 1)+
+  theme(legend.position="bottom")
+
+```
+
+```{r analysis}
+weeks_met_552<-
+met_vdh %>% 
+  group_by(compass_id) %>% 
+  summarise(weeks_present = n(),
+            weeks_met = sum(overall.vdh)) %>% 
+  mutate(perc_present = round(100*weeks_met/weeks_present,0))
+
+weeks_met_552
+
+ggplot(data=weeks_met_552 %>% filter(weeks_present>=13), aes(x = perc_present))+
+  geom_histogram(binwidth = 25)
+
+ggplot(data=weeks_met_552 %>% filter(weeks_present>=13), aes(y = perc_present))+
+  geom_boxplot()+
+  scale_y_continuous(n.breaks = 10)
+
+```
+
+
+
+
+
