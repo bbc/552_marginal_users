@@ -18,6 +18,7 @@ library(tidyverse)
 library(lubridate)
 library(httr)
 library(curl)
+library(scales)
 theme_set(theme_classic())
 ```
 
@@ -310,26 +311,199 @@ met_vdh %>%  select(compass_id,update_date, overall.vdh) %>% filter(compass_id %
 
 ```
 
-```{r analysis}
+### Analysis
+
+```{r analysis1}
 weeks_met_552<-
 met_vdh %>% 
   group_by(compass_id) %>% 
+  mutate(median_weight = median(weight)) %>% 
+  group_by(compass_id, median_weight) %>%
   summarise(weeks_present = n(),
             weeks_met = sum(overall.vdh)) %>% 
-  mutate(perc_present = round(100*weeks_met/weeks_present,0))
+  mutate(perc_present = round(100*weeks_met/weeks_present,0))%>% 
+  filter(weeks_present>=13) %>%  ##only want to look at those who were there for more than 13 weeks
+    mutate(perc_bands =
+   cut(perc_present, breaks = c( 0,10, 20, 30, 40,50,60,70,80,90,100),
+      labels = c('0-10','11-20','21-30','31-40','41-50','51-60','61-70','71-80','81-90','91-100'),
+      include.lowest = TRUE) 
+) 
 
 weeks_met_552
 
-ggplot(data=weeks_met_552 %>% filter(weeks_present>=13), aes(x = perc_present))+
-  geom_histogram(binwidth = 25)
+## histogram based on panellists
+ggplot(data=weeks_met_552, aes(x = perc_present))+
+  geom_histogram(binwidth = 25)+
+  labs(title = "Number of panellists who met 552 during the weeks present")+
+  ylab("Number of panellists")+
+  xlab("Percentage of weeks present")+
+  scale_y_continuous(n.breaks = 10)
+  
 
-ggplot(data=weeks_met_552 %>% filter(weeks_present>=13), aes(y = perc_present))+
+
+ggplot(data=weeks_met_552 , aes(y = perc_present))+
   geom_boxplot()+
   scale_y_continuous(n.breaks = 10)
 
 ```
 
 
+```{r analysis2}
+
+##how many people 
+length(weeks_met_552$compass_id) #3792
 
 
+perc_df<-
+weeks_met_552 %>%
+  group_by(perc_bands) %>% 
+  summarise(panellists = n()) %>% 
+left_join(
+  weeks_met_552 %>%
+  group_by(perc_bands) %>% 
+  summarise(users = sum(median_weight) )
+)
+  
+perc_df
+## bar chart based on scaling people up to nat rep using their panelist weight
+##the weight's median value were found as it's re-calcualted each week
+perc_df %>% gather(key = metric, value = value, 2:3) %>% group_by(metric) %>% mutate(perc = paste0(round(100*value/sum(value),0),"%") ) %>% 
+ggplot(aes(x = perc_bands, y = value, fill= metric ))+
+  geom_bar(stat="identity", position=position_dodge())+
+  facet_wrap(~metric, scale = "free", nrow = 2)+
+  geom_text(aes(label=perc), vjust=1.6, color="white",
+            position = position_dodge(0.9), size=3.5)+
+  scale_y_continuous(labels = comma)
+
+  
+```
+
+
+Users appear to be very habitual as they're either meeting 552 most weeks, or rarely. The opportunity audience isn't particularly large.
+
+* Always - those above 80% (30% of users)
+* Mostly - those from 50% to 80% (12% of users)
+* Sometimes - those from 20% to 50% (17% of users)
+* Rarely - those from 0-20% (41% of users)
+
+
+```{r categorise}
+weeks_met_552<-
+weeks_met_552 %>% 
+  mutate(usage_group = case_when(perc_present <=20 ~ 'rarely',
+                                 perc_present >20 &   perc_present <=50 ~ 'sometimes',
+                                 perc_present >50 &   perc_present <=80 ~ 'mostly',
+                                 perc_present >80 ~ 'always' )   ) %>% 
+  mutate(marginal = case_when(usage_group =='sometimes' | usage_group == 'mostly' ~ 1,
+                              usage_group =='rarely' | usage_group == 'always' ~ 0
+                              ))
+
+```
+
+
+```{r get demograpics}
+
+## Users will have two ages over the year (as it's re-taken each week) and some change social grade 
+## so clean the data to get the most common value for that user across the year
+get_demographics<-function(demo){
+  demographic<-
+      dbGetQuery(
+    conn,
+    paste0("SELECT compass_id,", demo," 
+    FROM research_measurement_data.compass_panelists_enriched
+    WHERE update_date >= '2022-01-01' AND update_date < '2023-01-01'
+    ORDER BY compass_id;"
+  ) )
+  
+  print(demo)
+  print(demographic %>% group_by(compass_id) %>% unique() %>% count() %>% group_by(n) %>% count())
+  
+  demographic<- demographic %>% group_by(compass_id, !!sym(demo)) %>% summarise(n =n()) %>% top_n(1) %>% select(-n)
+  print(demographic %>% group_by(compass_id) %>% unique() %>% count() %>% group_by(n) %>% count())
+  return(demographic)
+}
+
+age<-get_demographics("age")
+gender<-get_demographics("gender")
+nation<-get_demographics("nation")
+social_grade<-get_demographics("social_grade_2")
+
+age %>% group_by(compass_id) %>% count() %>% group_by(n) %>% count()
+
+# get all demographics together
+demographics<- age %>% left_join(gender)%>% left_join(nation)%>% left_join(social_grade)
+
+
+weeks_met_552<-weeks_met_552 %>% left_join(demographics)
+weeks_met_552<- weeks_met_552 %>% mutate(age_range = case_when(age <16 ~'under 16',
+                                                               age >=16 & age <35 ~ '16-34',
+                                                               age >=35 & age <55 ~'35-55',
+                                                               age >=55 ~'55+'))
+weeks_met_552
+weeks_met_552$usage_group<-factor(weeks_met_552$usage_group, levels = c("rarely",'sometimes','mostly','always'))
+weeks_met_552$gender<-factor(weeks_met_552$gender, levels = c("male",'female'))
+
+nation_lookup<- data.frame(nation = c(1:4), nation_name = c("England","Wales","Scotland","NI")  )
+weeks_met_552<-weeks_met_552 %>% mutate(nation = case_when(nation ==1 ~ 'England',
+                                                           nation ==2 ~ 'Wales',
+                                                           nation ==3 ~ 'Scotland',
+                                                           nation ==4 ~ 'NI'
+                                                           ) )
+weeks_met_552<-weeks_met_552 %>% rename('social_grade' =social_grade_2) 
+weeks_met_552<-weeks_met_552 %>% mutate(social_grade = case_when(social_grade ==1 ~ 'AB',
+                                                           social_grade ==2 ~ 'C1',
+                                                           social_grade ==3 ~ 'C2',
+                                                           social_grade ==4 ~ 'DE',
+                                                           social_grade ==5 ~ 'refused'
+                                                           ) )
+
+
+```
+
+```{r marginal_gaphs}
+group_totals<-weeks_met_552 %>% group_by(usage_group) %>% summarise(group_total = round(sum(median_weight),-6))
+library(wesanderson)
+
+make_demo_graph <- function(measure) {
+  measure<-gsub(' ','_',tolower(measure))
+  print(measure)
+  
+  df <-
+    weeks_met_552 %>% group_by(usage_group, !!sym(measure)) %>% summarise(total = sum(median_weight)) %>%
+    group_by(usage_group) %>% mutate(perc = paste0(round(100 * total / sum(total), 0), "%"))
+  
+  
+  ggplot(data = df, aes(x = usage_group, y = total, fill = !!sym(measure))) +
+    geom_bar(stat = "identity", position = position_stack()) +
+    geom_text(aes(label = perc),
+              position = position_stack(vjust = 0.5),
+              colour = "black") +
+    scale_y_continuous(labels = comma,
+                       n.breaks = 10) +
+    labs(title = "Frequency of users meeting the 552 definition") +
+    ylab("Users") +
+    theme(legend.position = "bottom",
+          axis.title.x = element_blank()) +
+    {if(measure == 'gender')scale_fill_manual(name = "Gender",values=wes_palette(n=3, name="GrandBudapest1"))
+    else if (measure == 'age_range')scale_fill_manual(name = "Age Range",values = wes_palette(n = 3, name = "Darjeeling1"))
+         else if (measure == 'social_grade')scale_fill_manual(name = "Social Grade",values = wes_palette(n = 5, name = "Darjeeling2"))
+      }+
+    geom_label(
+      data = group_totals,
+      aes(label = paste0(group_total / 1000000, " mil")),
+      y = group_totals$group_total %>% max(),
+      colour = "black",
+      fill = "white"
+    )
+  
+}
+
+
+make_demo_graph('Age Range')
+make_demo_graph('Gender')
+make_demo_graph('Nation')
+make_demo_graph('Social Grade')
+
+
+```
 
