@@ -507,3 +507,65 @@ make_demo_graph('Social Grade')
 
 ```
 
+What sections are people missing out by?
+
+```{r missing_out}
+
+met_vdh %>%  ungroup() %>% 
+  filter(overall.vdh == 0) %>% 
+  mutate(mins = ifelse( mins >= 5*60, 1, 0), ## if 5hrs then met target, else not met
+         dpw = ifelse( dpw >= 5, 1, 0),
+         platforms = ifelse( bbc.platforms >=2,1,0)
+           ) %>% 
+  select(compass_id, update_date, mins,dpw,platforms, bbc.tv) %>% 
+  group_by(mins,dpw,platforms, bbc.tv) %>% 
+  summarise(total = n()) %>% 
+  arrange(desc(total)) %>% 
+  ungroup() %>% 
+  mutate(perc = round(100*total/sum(total),0)  )
+
+```
+What factor makes people miss out the most? (for all users)
+
+* In 20% of cases they miss out on all metrics
+* in 18% they miss on minutes but meet all others
+* in 17% they miss on everything, but did watch tv
+* in 15% of cases they miss on minutes and days per week
+* in 13% of cases they miss on platforms but meet the other metrics
+
+
+```{r marginals_missing_out}
+
+met_vdh %>% 
+  left_join(weeks_met_552 %>% select(compass_id, usage_group, marginal), by  = "compass_id") %>% 
+  filter(marginal ==1) %>% 
+  ungroup() %>% 
+  filter(overall.vdh == 0) %>% 
+  mutate(mins = ifelse( mins >= 5*60, 1, 0), ## if 5hrs then met target, else not met
+         dpw = ifelse( dpw >= 5, 1, 0),
+         platforms = ifelse( bbc.platforms >=2,1,0)
+           ) %>% 
+  select(compass_id, update_date, mins,dpw,platforms, bbc.tv) %>% 
+  group_by(mins,dpw,platforms, bbc.tv) %>% 
+  summarise(total = n()) %>% 
+  arrange(desc(total)) %>% 
+  ungroup() %>% 
+  mutate(perc = round(100*total/sum(total),0)  )
+
+```
+What factor makes people miss out the most? (for all users)
+
+* In 32% they miss on minutes but meet all others (rather than 18%)
+* In 24% of cases they miss on platforms but meet the other metrics (rather than 13%)
+* In 12% of cases they miss on minutes and days per week (rather than 15%)
+
+This is quite different, but we are excluding everyone in the rarely group who just dont have a relationship with the BBC.
+
+
+
+
+
+
+
+
+
