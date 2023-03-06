@@ -1,9 +1,11 @@
 ---
-title: "vb_defining_552_users"
+title: "Which audience members are missing out on the 552 metric?"
 author: "VickyBanks"
 date: "`r Sys.Date()`"
 output: html_document
+
 ---
+# {.tabset .tabset-fade}
 
 ```{r setup, include=FALSE}
 #rm(list = ls())
@@ -19,10 +21,13 @@ library(lubridate)
 library(httr)
 library(curl)
 library(scales)
+library(kableExtra)
 theme_set(theme_classic())
 ```
 
-# Connect to the tables
+## Prepare Data
+
+### Connect to the tables
 
 ```{r}
 ######### Get Redshift creds (local R) #########
@@ -70,7 +75,8 @@ vars.audience = as.data.frame(colnames(compass.audience))
 vars.panel = as.data.frame(colnames(compass.panel))
 
 ```
-# Creating Overall VDH
+
+### Creating Overall VDH
 
 This section creates a resp-week level table with time, dpw, and breadth at an overall level.
 
@@ -311,7 +317,9 @@ met_vdh %>%  select(compass_id,update_date, overall.vdh) %>% filter(compass_id %
 
 ```
 
-### Analysis
+## Analysis
+
+### Labelling users as having met 552
 
 ```{r analysis1}
 weeks_met_552<-
@@ -331,7 +339,8 @@ met_vdh %>%
 
 weeks_met_552
 
-## histogram based on panellists
+
+## histogram based on panelists
 ggplot(data=weeks_met_552, aes(x = perc_present))+
   geom_histogram(binwidth = 25)+
   labs(title = "Number of panellists who met 552 during the weeks present")+
@@ -347,10 +356,11 @@ ggplot(data=weeks_met_552 , aes(y = perc_present))+
 
 ```
 
+### What proportions met 552
 
 ```{r analysis2}
 
-##how many people 
+## how many people 
 length(weeks_met_552$compass_id) #3792
 
 
@@ -387,6 +397,8 @@ Users appear to be very habitual as they're either meeting 552 most weeks, or ra
 * Rarely - those from 0-20% (41% of users)
 
 
+
+
 ```{r categorise}
 weeks_met_552<-
 weeks_met_552 %>% 
@@ -400,6 +412,7 @@ weeks_met_552 %>%
 
 ```
 
+### Analyse groups based on demographics
 
 ```{r get demograpics}
 
@@ -415,11 +428,11 @@ get_demographics<-function(demo){
     ORDER BY compass_id;"
   ) )
   
-  print(demo)
-  print(demographic %>% group_by(compass_id) %>% unique() %>% count() %>% group_by(n) %>% count())
+  #print(demo)
+ #print(demographic %>% group_by(compass_id) %>% unique() %>% count() %>% group_by(n) %>% count())
   
   demographic<- demographic %>% group_by(compass_id, !!sym(demo)) %>% summarise(n =n()) %>% top_n(1) %>% select(-n)
-  print(demographic %>% group_by(compass_id) %>% unique() %>% count() %>% group_by(n) %>% count())
+  #print(demographic %>% group_by(compass_id) %>% unique() %>% count() %>% group_by(n) %>% count())
   return(demographic)
 }
 
@@ -428,7 +441,7 @@ gender<-get_demographics("gender")
 nation<-get_demographics("nation")
 social_grade<-get_demographics("social_grade_2")
 
-age %>% group_by(compass_id) %>% count() %>% group_by(n) %>% count()
+#age %>% group_by(compass_id) %>% count() %>% group_by(n) %>% count()
 
 # get all demographics together
 demographics<- age %>% left_join(gender)%>% left_join(nation)%>% left_join(social_grade)
@@ -439,7 +452,7 @@ weeks_met_552<- weeks_met_552 %>% mutate(age_range = case_when(age <16 ~'under 1
                                                                age >=16 & age <35 ~ '16-34',
                                                                age >=35 & age <55 ~'35-55',
                                                                age >=55 ~'55+'))
-weeks_met_552
+
 weeks_met_552$usage_group<-factor(weeks_met_552$usage_group, levels = c("rarely",'sometimes','mostly','always'))
 weeks_met_552$gender<-factor(weeks_met_552$gender, levels = c("male",'female'))
 
@@ -460,16 +473,19 @@ weeks_met_552<-weeks_met_552 %>% mutate(social_grade = case_when(social_grade ==
 
 ```
 
+## Demographic Graphs
+
+
 ```{r marginal_gaphs}
 group_totals<-weeks_met_552 %>% group_by(usage_group) %>% summarise(group_total = round(sum(median_weight),-6))
 library(wesanderson)
 
-make_demo_graph <- function(measure) {
+make_demo_graph <- function(measure, input_df, age_range) {
   measure<-gsub(' ','_',tolower(measure))
   print(measure)
   
   df <-
-    weeks_met_552 %>% group_by(usage_group, !!sym(measure)) %>% summarise(total = sum(median_weight)) %>%
+    input_df %>% group_by(usage_group, !!sym(measure)) %>% summarise(total = sum(median_weight)) %>%
     group_by(usage_group) %>% mutate(perc = paste0(round(100 * total / sum(total), 0), "%"))
   
   
@@ -480,7 +496,7 @@ make_demo_graph <- function(measure) {
               colour = "black") +
     scale_y_continuous(labels = comma,
                        n.breaks = 10) +
-    labs(title = "Frequency of users meeting the 552 definition") +
+    labs(title = paste0("Frequency of users meeting the 552 definition (",age_range,").")) +
     ylab("Users") +
     theme(legend.position = "bottom",
           axis.title.x = element_blank()) +
@@ -499,18 +515,22 @@ make_demo_graph <- function(measure) {
 }
 
 
-make_demo_graph('Age Range')
-make_demo_graph('Gender')
-make_demo_graph('Nation')
-make_demo_graph('Social Grade')
+make_demo_graph('Age Range', weeks_met_552, "all 16+")
+make_demo_graph('Gender', weeks_met_552, "all 16+")
+make_demo_graph('Nation', weeks_met_552, "all 16+")
+make_demo_graph('Social Grade', weeks_met_552, "all 16+")
 
 
 ```
 
+## Factors in missing 552
+
 What sections are people missing out by?
 
-```{r missing_out}
+### All users
 
+```{r missing_out}
+missing_out_16_all<-
 met_vdh %>%  ungroup() %>% 
   filter(overall.vdh == 0) %>% 
   mutate(mins = ifelse( mins >= 5*60, 1, 0), ## if 5hrs then met target, else not met
@@ -522,9 +542,16 @@ met_vdh %>%  ungroup() %>%
   summarise(total = n()) %>% 
   arrange(desc(total)) %>% 
   ungroup() %>% 
-  mutate(perc = round(100*total/sum(total),0)  )
+  mutate(perc = round(100*total/sum(total),0)  ) 
 
+missing_out_16_all %>% 
+    kbl(booktabs = T, caption = "What factors cause users to miss out on 552.(all 16+) ",
+      col.names = c("5 hrs", "5 days","2 modes","BBC TV", "total", "%"),
+      align = 'r',
+    escape = F) %>%
+  kable_styling(bootstrap_options =c("striped", "scale_down","hover"))
 ```
+
 What factor makes people miss out the most? (for all users)
 
 * In 20% of cases they miss out on all metrics
@@ -534,8 +561,10 @@ What factor makes people miss out the most? (for all users)
 * in 13% of cases they miss on platforms but meet the other metrics
 
 
-```{r marginals_missing_out}
+### Marginal users
 
+```{r marginals_missing_out}
+missing_out_16_marginal<-
 met_vdh %>% 
   left_join(weeks_met_552 %>% select(compass_id, usage_group, marginal), by  = "compass_id") %>% 
   filter(marginal ==1) %>% 
@@ -550,17 +579,248 @@ met_vdh %>%
   summarise(total = n()) %>% 
   arrange(desc(total)) %>% 
   ungroup() %>% 
-  mutate(perc = round(100*total/sum(total),0)  )
+  mutate(perc = round(100*total/sum(total),0)  ) 
+
+missing_out_16_marginal %>% 
+      kbl(booktabs = T, caption = "What factors cause users to miss out on 552. (Marginal users 16+)",
+      col.names = c("5 hrs", "5 days","2 modes","BBC TV", "total", "%"),
+      align = 'r',
+    escape = F) %>%
+  kable_styling(bootstrap_options =c("striped", "scale_down","hover"))
 
 ```
-What factor makes people miss out the most? (for all users)
+What factor makes people miss out the most? 
 
 * In 32% they miss on minutes but meet all others (rather than 18%)
 * In 24% of cases they miss on platforms but meet the other metrics (rather than 13%)
 * In 12% of cases they miss on minutes and days per week (rather than 15%)
 
-This is quite different, but we are excluding everyone in the rarely group who just dont have a relationship with the BBC.
+This is quite different, but we are excluding everyone in the rarely group who just don't have a relationship with the BBC.
 
+
+## 16-34 Demographics
+
+Repeating the demographic splits for just the 16-34 age group. 
+
+```{r 16-34-demo}
+
+make_demo_graph('Age Range', weeks_met_552 %>% filter(age_range =='16-34'), "age 16-34")
+make_demo_graph('Gender', weeks_met_552 %>% filter(age_range =='16-34'), "age 16-34")
+make_demo_graph('Nation', weeks_met_552 %>% filter(age_range =='16-34'), "age 16-34")
+make_demo_graph('Social Grade', weeks_met_552 %>% filter(age_range =='16-34'), "age 16-34")
+
+
+```
+
+### All users
+
+```{r missing_out_16-34}
+
+missing_out_16_34_all<-
+met_vdh %>%  ungroup() %>% 
+  inner_join(demographics %>% filter(age >=16 & age <35) %>% select(compass_id)) %>%
+  filter(overall.vdh == 0) %>% 
+  mutate(mins = ifelse( mins >= 5*60, 1, 0), ## if 5hrs then met target, else not met
+         dpw = ifelse( dpw >= 5, 1, 0),
+         platforms = ifelse( bbc.platforms >=2,1,0)
+           ) %>% 
+  select(compass_id, update_date, mins,dpw,platforms, bbc.tv) %>% 
+  group_by(mins,dpw,platforms, bbc.tv) %>% 
+  summarise(total = n()) %>% 
+  arrange(desc(total)) %>% 
+  ungroup() %>% 
+  mutate(perc = round(100*total/sum(total),0)  ) 
+
+missing_out_16_34_all%>% 
+    kbl(booktabs = T, caption = "What factors cause users to miss out on 552.(all 16-34) ",
+      col.names = c("5 hrs", "5 days","2 modes","BBC TV", "total", "%"),
+      align = 'r',
+    escape = F) %>%
+  kable_styling(bootstrap_options =c("striped", "scale_down","hover"))
+
+```
+
+What factor makes people miss out the most? (for all users)
+
+* In 32% of cases they miss out on all metrics
+* in 18% they miss on everything, but did watch tv
+* in 17% they did watch some tv and used two platforms
+* in 15% of cases they miss on minutes but meet the other metrics
+
+
+
+### Marginal users
+
+```{r marginals_missing_out_16-34}
+missing_out_16_34_marginal<-
+met_vdh %>% 
+  inner_join(demographics %>% filter(age >=16 & age <35) %>% select(compass_id)) %>%
+  left_join(weeks_met_552 %>% select(compass_id, usage_group, marginal), by  = "compass_id") %>% 
+  filter(marginal ==1) %>% 
+  ungroup() %>% 
+  filter(overall.vdh == 0) %>% 
+  mutate(mins = ifelse( mins >= 5*60, 1, 0), ## if 5hrs then met target, else not met
+         dpw = ifelse( dpw >= 5, 1, 0),
+         platforms = ifelse( bbc.platforms >=2,1,0)
+           ) %>% 
+  select(compass_id, update_date, mins,dpw,platforms, bbc.tv) %>% 
+  group_by(mins,dpw,platforms, bbc.tv) %>% 
+  summarise(total = n()) %>% 
+  arrange(desc(total)) %>% 
+  ungroup() %>% 
+  mutate(perc = round(100*total/sum(total),0)  ) 
+
+missing_out_16_34_marginal %>% 
+      kbl(booktabs = T, caption = "What factors cause users to miss out on 552. (Marginal users 16-34)",
+      col.names = c("5 hrs", "5 days","2 modes","BBC TV", "total", "%"),
+      align = 'r',
+    escape = F) %>%
+  kable_styling(bootstrap_options =c("striped", "scale_down","hover"))
+
+```
+What factor makes people miss out the most? 
+
+* In 37% they miss on minutes but meet all others (rather than 15%)
+* In 17% of cases they did watch some tv and used two platforms (same as for all users)
+* In 10% of cases they miss on platforms but meet the other metrics (rather than 3%)
+
+
+
+```{r write_to excel}
+
+## For how to write to excel with multiple sheets
+library(openxlsx)
+#library(write.xlsx)
+library(xlsx)
+##get a list of the df names
+df_names<-ls()[grepl('data.frame', sapply(ls(), function(x) class(get(x))))] #get all df
+df_names<-df_names[grep('missing', df_names)] ## get those with right name
+
+
+## list containing the df
+df_list<- lapply(df_names, get)
+df_list
+
+## change the names to be more readable
+change_col_names <- function(x) {
+    names(x) <- c("five_hrs", "five_days", "two_modes","used_tv","total","percentage")
+    return(x)
+}
+df_list <- lapply(df_list, change_col_names)
+
+
+for(name in 1:length(df_names)){
+  print( df_names[name])
+  write.xlsx(x = df_list[name],
+             file = "factors_causing_users_to_miss_552.xlsx", ##set wd or give full path
+             sheetName =df_names[name],
+             row.names = FALSE,
+             col.name = TRUE,
+             append = TRUE
+             )
+
+}
+
+
+```
+
+## Distribution of minutes on platforms
+
+```{r min_on_platforms}
+hrs_per_platform <-
+compass.audience %>% 
+  select(compass_id, update_date,duration_secs,bbc.platform) %>% 
+  mutate(update_date = ymd(update_date)) %>% 
+  group_by(compass_id, update_date, bbc.platform) %>% 
+  summarise(time_hrs =sum(duration_secs)/(60*60) ) %>% ## get hours on each platform
+  arrange(compass_id,update_date, bbc.platform)  %>% 
+  spread(key = bbc.platform, value = time_hrs) %>% 
+  replace(is.na(.),0) %>% 
+  inner_join( ## join in demographics and usage
+    weeks_met_552 %>% select(
+      compass_id,
+      usage_group,
+      marginal,
+      age_range,
+      gender,
+      nation,
+      social_grade
+    ) ,
+    by = "compass_id"
+  )
+
+hrs_per_platform
+
+hours_usage_hist <- function(df, variable, age) {
+  var <- variable
+
+  
+  grouped_hours <-
+    df  %>%
+    group_by(usage_group) %>%
+    mutate({{var}} :=
+      cut(
+        !!sym(var),
+        breaks = c(0, 1, 2, 3, 4, 5, 10000),
+        labels = c('0', '1', '2', '3', '4', '5+'),
+        include.lowest = TRUE
+      )) %>%
+    ungroup() %>%
+    group_by(usage_group,!!sym(var)) %>%
+    count() %>%
+    ungroup() %>%
+    group_by(usage_group) %>%
+    mutate(perc = round(100 * n / sum(n), 0))
+  
+  grouped_hours
+  
+  
+  ggplot(data = grouped_hours, aes(
+    x = !!sym(var),
+    y = n,
+    fill = usage_group
+  )) +
+    geom_bar(stat = "identity", position = position_dodge()) +
+    scale_y_continuous(n.breaks = 5, labels = comma) +
+    geom_text(
+      data = grouped_hours %>% filter(perc >= 4),
+      aes(label = paste0(perc, "%")),
+      vjust = 0.9,
+      color = "black",
+      position = position_dodge(1),
+      size = 3.5
+    ) +
+    facet_wrap( ~ usage_group, nrow = 4, scales = "free") +
+    ylab("Total") +
+    xlab(paste0("'", var, "'",  " hours per week")) +
+    ggtitle(paste0("Hours per week consumed on '", var, "' (",age,")"))
+  
+}
+
+### All weeks including when VDH was met
+hours_usage_hist(hrs_per_platform, "Watching", "16+")
+hours_usage_hist(hrs_per_platform,"Listening","16+")
+hours_usage_hist(hrs_per_platform,"Explore","16+")
+
+
+
+```
+
+### Instances where VDH was not met
+
+```{r min_on_platform_no_vdh } 
+hrs_per_platform_vdh<-
+hrs_per_platform %>% 
+  inner_join(
+  met_vdh %>% select(compass_id, update_date, overall.vdh) %>% filter(overall.vdh ==0 ), 
+  by =c("compass_id", 'update_date') 
+)
+### All weeks including when VDH was met
+hours_usage_hist(hrs_per_platform_vdh, "Watching", "16+")
+hours_usage_hist(hrs_per_platform_vdh,"Listening","16+")
+hours_usage_hist(hrs_per_platform_vdh,"Explore","16+")
+
+```
 
 
 
